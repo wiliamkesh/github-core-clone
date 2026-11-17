@@ -298,9 +298,12 @@ export class Store {
   /**
    * Every object reachable from `tips`, minus anything in `exclude`
    * (objects the client already holds). Returns oids in traversal order.
-   * Tag -> target; commit -> tree + parents; tree -> entries except gitlinks.
+   * Tag -> target; commit -> tree + parents (parents only when they are in
+   * `followParents`, when given — the depth limit for shallow fetches, and
+   * never past a commit in `stopAt` — a shallow boundary the client holds
+   * without its parents); tree -> entries except gitlinks.
    */
-  reachableObjects(tips: string[], exclude: Set<string>): string[] {
+  reachableObjects(tips: string[], exclude: Set<string>, followParents?: Set<string>, stopAt?: Set<string>): string[] {
     const out: string[] = [];
     const seen = new Set<string>(exclude);
     const stack = [...tips].map((t) => t.toLowerCase());
@@ -314,7 +317,13 @@ export class Store {
       if (obj.type === 'commit') {
         const info = parseCommit(obj.data);
         stack.push(info.tree.toLowerCase());
-        for (const p of info.parents) stack.push(p.toLowerCase());
+        if (stopAt?.has(oid)) {
+          // Shallow boundary: the client holds this commit but not its parents.
+        } else {
+          for (const p of info.parents) {
+            if (!followParents || followParents.has(p.toLowerCase())) stack.push(p.toLowerCase());
+          }
+        }
       } else if (obj.type === 'tree') {
         for (const e of parseTree(obj.data)) {
           if (e.mode === '160000') continue;
@@ -506,7 +515,9 @@ export class Store {
     const epoch = this.nowSec();
     const commit = this.putObject(
       makeCommit({
-        tree: treeOid ?? baseTree,
+        // An emptied tree is still a tree (the empty tree object), never the
+        // old tree — falling back to baseTree here would resurrect the file.
+        tree: treeOid ?? this.putObject(makeTree([])).id,
         parents: [tip],
         author: identLine(VIEWER, epoch),
         committer: identLine(VIEWER, epoch),

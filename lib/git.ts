@@ -228,7 +228,8 @@ function planFetch(store: Store, plan: FetchPlan): FetchResult {
   const D = plan.deepen ?? Infinity;
   const clientShallow = new Set(plan.shallows.map((s) => s.toLowerCase()));
   const included = new Set<string>();
-  // BFS by distance from the wants.
+  // BFS by distance from the wants. Tags are wants too (clone asks for tag
+  // oids): include the tag object and walk to its target at the same depth.
   const queue: { oid: string; dist: number }[] = plan.wants.map((w) => ({ oid: w.toLowerCase(), dist: 0 }));
   const seenDist = new Map<string, number>();
   while (queue.length > 0) {
@@ -236,11 +237,21 @@ function planFetch(store: Store, plan: FetchPlan): FetchResult {
     if (seenDist.has(oid) || dist >= D || oid === ZERO_OID) continue;
     seenDist.set(oid, dist);
     const obj = store.getObject(oid);
-    if (!obj || obj.type !== 'commit') continue;
+    if (!obj) continue;
     included.add(oid);
-    const info = parseCommit(obj.data);
-    if (clientShallow.has(oid)) continue; // do not walk past a shallow boundary
-    for (const p of info.parents) queue.push({ oid: p.toLowerCase(), dist: dist + 1 });
+    if (obj.type === 'commit') {
+      const info = parseCommit(obj.data);
+      // A shallow boundary blocks traversal ONLY when no deepen was asked:
+      // deepen=N redefines the depth from the wants, so the old boundary's
+      // parents are included up to the new depth. (The shallow lines still
+      // matter for the have-exclusion below and for unshallow reporting.)
+      if (plan.deepen === null && clientShallow.has(oid)) continue;
+      for (const p of info.parents) queue.push({ oid: p.toLowerCase(), dist: dist + 1 });
+    } else if (obj.type === 'tag') {
+      const text = obj.data.toString('utf8');
+      const m = /^object ([0-9a-f]{40})$/m.exec(text);
+      if (m) queue.push({ oid: m[1], dist });
+    }
   }
   // Boundary commits are included commits with a parent that is NOT included.
   const shallow: string[] = [];
@@ -261,9 +272,15 @@ function planFetch(store: Store, plan: FetchPlan): FetchResult {
     const info = parseCommit(obj.data);
     if (info.parents.some((p) => included.has(p.toLowerCase()))) unshallow.push(oid);
   }
-  // Objects to send.
-  const haveClosure = new Set(store.reachableObjects(plan.haves, new Set()));
-  const toSend = store.reachableObjects([...included], haveClosure);
+  // Objects to send: the depth-limited closure of the included commits
+  // (parents only when they are themselves included — the shallow limit),
+  // minus what the client holds. What the client holds is the closure of
+  // the haves STOPPED at its shallow boundaries: a shallow clone holds the
+  // boundary commit and its tree, but NOT the boundary's parents.
+  const haveClosure = new Set(
+    store.reachableObjects(plan.haves, new Set(), undefined, new Set(plan.shallows.map((s) => s.toLowerCase()))),
+  );
+  const toSend = store.reachableObjects([...included], haveClosure, included);
   const objects = toSend
     .map((oid) => store.getObject(oid))
     .filter((o): o is NonNullable<typeof o> => o !== undefined);

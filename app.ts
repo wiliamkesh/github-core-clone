@@ -9,6 +9,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Store } from './lib/store.ts';
 import { handleGit } from './lib/git.ts';
 import { handleRest } from './lib/rest.ts';
+import { handleGraphql } from './lib/graphql.ts';
+import { handleMcp } from './lib/mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 
@@ -45,6 +47,12 @@ export function createApp(): Server {
 
         // REST v3 (/api/v3/...). Returns true when handled.
         if (await handleRest(store, token, req, res)) return;
+
+        // GraphQL v4 (/api/graphql). Returns true when handled.
+        if (await handleGraphql(store, token, req, res)) return;
+
+        // MCP (/mcp). Returns true when handled.
+        if (await handleMcp(store, token, req, res)) return;
 
         const path = pathOf(req);
         const method = req.method ?? 'GET';

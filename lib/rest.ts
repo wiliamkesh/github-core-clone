@@ -118,7 +118,13 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
   }
   const path = url.pathname;
   const method = req.method ?? 'GET';
-  if (!path.startsWith('/api/v3/')) return false;
+  if (!path.startsWith('/api/v3/') && path !== '/api/v3') return false;
+
+  // API root (no auth): 200 with the token's scopes.
+  if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
+    sendJson(store, res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+    return true;
+  }
 
   // -- No-auth informational endpoints -------------------------------------
   if (method === 'GET' && path === '/api/v3/meta') {
@@ -218,8 +224,9 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
     const repo = getRepoOr404(store, res, owner, repoName);
     if (!repo) return true;
     const out = [...repo.refs.keys()]
+      .filter((name) => name.startsWith('refs/heads/'))
       .sort()
-      .map((name) => ({ name, commit: { sha: repo.refs.get(name)! } }));
+      .map((name) => ({ name: name.replace(/^refs\/heads\//, ''), commit: { sha: repo.refs.get(name)! } }));
     sendJson(store, res, 200, out);
     return true;
   }
