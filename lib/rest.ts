@@ -372,7 +372,14 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
         labels.push(l);
       }
       const issue = store.createIssue(repo, title, str(body.body) ?? '', labels);
-      sendJson(store, res, 201, store.issueJson(repo, issue));
+      // createIssue already built the pre-serialized buffer + ETag: serve it
+      // directly instead of building the object and stringifying it again
+      // (the write benchmark: 200 sequential creates).
+      if (issue.jsonCache) {
+        sendBuffer(store, res, 201, issue.jsonCache);
+      } else {
+        sendJson(store, res, 201, store.issueJson(repo, issue));
+      }
       return true;
     }
     if (method === 'GET') {

@@ -262,12 +262,32 @@ export class Store {
     return out;
   }
 
+  /**
+   * Is `ancestor` reachable from `oid` (including ancestor === oid)?
+   * Early-exit walk: the old code built the FULL ancestor list first
+   * (commitAncestors + includes), which made every push O(chain depth) —
+   * the push benchmark's chain grows past 600 commits, so a round paid
+   * ~200 walks of ~300 commits each. A push's old tip is the new commit's
+   * immediate parent, so the walk usually stops after one step; the result
+   * is identical (reachability in the parent graph, merges included).
+   */
   isAncestor(ancestor: string, oid: string): boolean {
     if (ancestor === ZERO_OID) return true;
     const a = ancestor.toLowerCase();
     const o = oid.toLowerCase();
     if (a === o) return true;
-    return this.commitAncestors(o).includes(a);
+    const seen = new Set<string>();
+    const stack = [o];
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      if (cur === a) return true;
+      if (cur === ZERO_OID || seen.has(cur)) continue;
+      seen.add(cur);
+      const obj = this.objects.get(cur);
+      if (!obj || obj.type !== 'commit') continue;
+      for (const p of parseCommit(obj.data).parents) stack.push(p.toLowerCase());
+    }
+    return false;
   }
 
   /** First common ancestor of two commits (merge base), or null. */

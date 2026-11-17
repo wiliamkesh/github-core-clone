@@ -543,7 +543,9 @@ function handleReceivePack(store: Store, repo: Repo, body: Buffer, res: ServerRe
       unpackError = 'missing pack';
     } else {
       try {
-        const objects = parsePack(packBytes);
+        // REF_DELTA bases may live in the store, not the pack (thin packs
+        // from real git clients): resolveBase falls back to stored objects.
+        const objects = parsePack(packBytes, (id) => store.getObject(id));
         for (const obj of objects) store.putObject(obj);
       } catch (err) {
         unpackError = err instanceof Error ? err.message : 'pack parse failed';

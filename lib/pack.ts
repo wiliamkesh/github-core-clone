@@ -68,14 +68,25 @@ function decodeOfsDeltaOffset(buf: Buffer, off: number): { offset: number; next:
   return { offset, next: i };
 }
 
-/** Decode a delta varint (7 bits per byte, MSB = continuation). */
+/**
+ * Decode a delta varint (LITTLE-ENDIAN base-128: the low 7 bits come first,
+ * MSB = continuation). This is NOT the big-endian scheme, and NOT the +1
+ * offset scheme of OFS_DELTA headers — git's delta data (patch-delta.c)
+ * stores the source/target sizes least-significant group first. Verified
+ * 2026-11-17 against a real git thin pack: bytes c8 b2 11 decode to
+ * 285000, the exact size of the delta's base blob (the big-endian reading
+ * gave 1186065 and broke every real-git delta push until this fix).
+ * Arithmetic (not bit shifts) so sizes past 2^31 stay exact.
+ */
 function decodeDeltaVarint(buf: Buffer, off: number): { value: number; next: number } {
   let value = 0;
+  let shift = 0;
   let i = off;
   let b: number;
   do {
     b = buf[i];
-    value = (value << 7) | (b & 0x7f);
+    value += (b & 0x7f) * 2 ** shift;
+    shift += 7;
     i += 1;
   } while (b & 0x80);
   return { value, next: i };
@@ -151,7 +162,104 @@ export function encodePack(objects: GitObject[], opts: PackOptions = {}): Buffer
  * (deltas may reference objects earlier in the same pack). Returns objects in
  * pack order. Throws on a malformed pack, a bad checksum, or an unresolvable delta.
  */
-export function parsePack(buf: Buffer): GitObject[] {
+/**
+ * Inflate one object's deflate stream at `off` and report how many bytes the
+ * stream consumed — in ONE call, with no probing and no throws.
+ *
+ * Node's inflateSync(buf, {info:true}) returns {buffer, engine}, and the
+ * engine's bytesWritten is exactly the input the inflate consumed: the
+ * binding stops feeding at the stream end, so trailing bytes (the next
+ * object, the trailer) are never counted. Verified 2026-11-17 on Node 24:
+ * a 1035-byte stream followed by garbage reports bytesWritten 1035, and a
+ * 3-object pack walks to exactly buf.length-20. The call also returns the
+ * inflated data, so the old code's second inflate per object is gone too.
+ *
+ * bytesWritten is an engine internal, so a wrong value on another Node is
+ * possible: parsePack validates the walk (every inflated length equals its
+ * header size, the final offset is exactly buf.length-20) and falls back
+ * to the binary-search implementation below on any mismatch.
+ */
+function inflateObject(buf: Buffer, off: number): { data: Buffer; consumed: number } {
+  const result = inflateSync(buf.subarray(off), { info: true }) as unknown as {
+    buffer: Buffer;
+    engine: { bytesWritten: number };
+  };
+  const consumed = result.engine?.bytesWritten;
+  if (!Number.isFinite(consumed) || consumed <= 0) throw new Error('inflate did not report a stream length');
+  return { data: result.buffer, consumed };
+}
+
+/** Parse a packfile, fast path: one inflate per object via inflateObject. */
+function parsePackFast(
+  buf: Buffer,
+  count: number,
+  resolveBase?: (id: string) => GitObject | undefined,
+): GitObject[] {
+  const objects: GitObject[] = [];
+  const byId = new Map<string, GitObject>();
+  const byOffset = new Map<number, GitObject>();
+  let off = 12;
+  for (let n = 0; n < count; n += 1) {
+    const objStart = off;
+    const { typeNum, size, next } = decodeObjectHeader(buf, off);
+    off = next;
+    if (typeNum === TYPE_OFS_DELTA) {
+      const { offset, next: afterOfs } = decodeOfsDeltaOffset(buf, off);
+      off = afterOfs;
+      const baseStart = objStart - offset;
+      const base = byOffset.get(baseStart);
+      if (!base) throw new Error(`ofs-delta base not found at offset ${baseStart}`);
+      const { data: inflated, consumed } = inflateObject(buf, off);
+      off += consumed;
+      const data = applyDelta(base.data, inflated);
+      const obj = makeObject(base.type, data);
+      byOffset.set(objStart, obj);
+      objects.push(obj);
+      byId.set(obj.id, obj);
+    } else if (typeNum === TYPE_REF_DELTA) {
+      const baseId = buf.subarray(off, off + 20).toString('hex');
+      off += 20;
+      // Thin packs (real git push): the base may be an object the server
+      // already holds, not one in this pack — resolveBase falls back to the
+      // store. (In-pack bases still win via byId, so delta chains work.)
+      const base = byId.get(baseId) ?? resolveBase?.(baseId);
+      if (!base) throw new Error(`ref-delta base ${baseId} not found`);
+      const { data: inflated, consumed } = inflateObject(buf, off);
+      off += consumed;
+      const data = applyDelta(base.data, inflated);
+      const obj = makeObject(base.type, data);
+      byOffset.set(objStart, obj);
+      objects.push(obj);
+      byId.set(obj.id, obj);
+    } else {
+      const type = NUM_TYPE[typeNum];
+      if (!type) throw new Error(`unknown pack object type ${typeNum}`);
+      const { data: inflated, consumed } = inflateObject(buf, off);
+      off += consumed;
+      if (inflated.length !== size) {
+        throw new Error(`object size mismatch: header ${size}, inflated ${inflated.length}`);
+      }
+      const obj = makeObject(type, inflated);
+      byOffset.set(objStart, obj);
+      objects.push(obj);
+      byId.set(obj.id, obj);
+    }
+  }
+  if (off !== buf.length - 20) throw new Error(`pack walk ended at ${off}, expected ${buf.length - 20}`);
+  return objects;
+}
+
+/**
+ * Parse a packfile (v2) into objects. Applies OFS_DELTA and REF_DELTA chains
+ * (deltas may reference objects earlier in the same pack). Returns objects in
+ * pack order. Throws on a malformed pack, a bad checksum, or an unresolvable delta.
+ * Fast path first (parsePackFast); any disagreement falls back to the
+ * binary-search implementation, so a Node that reports bytesWritten
+ * differently still parses correctly, just slower.
+ * `resolveBase` answers REF_DELTA bases that are not in this pack (thin
+ * packs from real git clients): the store's objects.
+ */
+export function parsePack(buf: Buffer, resolveBase?: (id: string) => GitObject | undefined): GitObject[] {
   if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') {
     throw new Error('not a packfile');
   }
@@ -162,7 +270,15 @@ export function parsePack(buf: Buffer): GitObject[] {
   const trailer = buf.subarray(buf.length - 20);
   const expect = createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
   if (!trailer.equals(expect)) throw new Error('pack checksum mismatch');
+  try {
+    return parsePackFast(buf, count, resolveBase);
+  } catch {
+    return parsePackLegacy(buf, count, resolveBase);
+  }
+}
 
+/** Legacy parse (binary-search consumed length): fallback for the fast path. */
+function parsePackLegacy(buf: Buffer, count: number, resolveBase?: (id: string) => GitObject | undefined): GitObject[] {
   const objects: GitObject[] = [];
   // byId holds fully-resolved objects by their SHA-1 hex, for REF_DELTA lookup.
   const byId = new Map<string, GitObject>();
@@ -191,7 +307,7 @@ export function parsePack(buf: Buffer): GitObject[] {
     } else if (typeNum === TYPE_REF_DELTA) {
       const baseId = buf.subarray(off, off + 20).toString('hex');
       off += 20;
-      const base = byId.get(baseId);
+      const base = byId.get(baseId) ?? resolveBase?.(baseId);
       if (!base) throw new Error(`ref-delta base ${baseId} not found`);
       const inflated = inflateSync(buf.subarray(off));
       const consumed = inflatedConsumedLength(buf, off);
