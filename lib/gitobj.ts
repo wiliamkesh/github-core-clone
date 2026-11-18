@@ -2,7 +2,7 @@
 // Standard git formats; the suite's git client verifies hashes and round-trips,
 // so serialization must be byte-exact. No wall clock here: timestamps come from
 // the store's logical clock so a replay is byte-identical.
-import { createHash } from 'node:crypto';
+import { hash as sha1Hash } from 'node:crypto';
 
 export type ObjType = 'blob' | 'tree' | 'commit' | 'tag';
 
@@ -14,14 +14,19 @@ export interface GitObject {
   readonly id: string;
 }
 
+/**
+ * One-shot SHA-1 hex of a buffer. `crypto.hash` skips the Hash object
+ * allocation of createHash/update/digest (~0.6µs per call on this box);
+ * the pack path hashes four times per push, so it adds up.
+ */
 export function sha1(buf: Buffer): string {
-  return createHash('sha1').update(buf).digest('hex');
+  return sha1Hash('sha1', buf, 'hex');
 }
 
 /** Build an object from its type and raw content bytes. */
 export function makeObject(type: ObjType, data: Buffer): GitObject {
   const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  const id = sha1(Buffer.concat([header, data]));
+  const id = sha1Hash('sha1', Buffer.concat([header, data]), 'hex');
   return { type, data, id };
 }
 

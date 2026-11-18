@@ -4,7 +4,7 @@
 // OFS_DELTA, because real git clients send delta-compressed packs on push.
 import { deflateSync, inflateSync } from 'node:zlib';
 import { Buffer } from 'node:buffer';
-import { createHash } from 'node:crypto';
+import { hash as sha1Hash } from 'node:crypto';
 import { makeObject, parseObject, type GitObject, type ObjType } from './gitobj.ts';
 
 // Pack object type numbers (git pack format).
@@ -153,8 +153,8 @@ export function encodePack(objects: GitObject[], opts: PackOptions = {}): Buffer
     parts.push(deflateSync(obj.data, { level }));
   }
   const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const trailer = sha1Hash('sha1', body, 'hex');
+  return Buffer.concat([body, Buffer.from(trailer, 'hex')]);
 }
 
 /**
@@ -266,10 +266,10 @@ export function parsePack(buf: Buffer, resolveBase?: (id: string) => GitObject |
   const version = buf.readUInt32BE(4);
   if (version !== 2) throw new Error(`unsupported pack version ${version}`);
   const count = buf.readUInt32BE(8);
-  // Verify the trailer checksum.
-  const trailer = buf.subarray(buf.length - 20);
-  const expect = createHash('sha1').update(buf.subarray(0, buf.length - 20)).digest();
-  if (!trailer.equals(expect)) throw new Error('pack checksum mismatch');
+  // Verify the trailer checksum (one-shot hash, no Hash object allocation).
+  const trailerHex = buf.subarray(buf.length - 20).toString('hex');
+  const expectHex = sha1Hash('sha1', buf.subarray(0, buf.length - 20), 'hex');
+  if (trailerHex !== expectHex) throw new Error('pack checksum mismatch');
   try {
     return parsePackFast(buf, count, resolveBase);
   } catch {

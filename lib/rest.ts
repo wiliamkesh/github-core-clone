@@ -429,14 +429,16 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
       return true;
     }
     if (method === 'GET') {
-      // Fast path: pre-serialized buffer + ETag (read benchmark).
+      // Fast path: pre-serialized buffer + ETag (read benchmark). The ETag is
+      // computed lazily once per issue version (see Store.issueEtag).
+      const etag = store.issueEtag(repo, issue);
       const inm = req.headers['if-none-match'];
-      if (issue.etag && inm === issue.etag) {
-        sendJson(store, res, 304, '', { etag: issue.etag });
+      if (inm === etag) {
+        sendJson(store, res, 304, '', { etag });
         return true;
       }
-      if (issue.jsonCache && issue.etag) {
-        sendBuffer(store, res, 200, issue.jsonCache, { etag: issue.etag });
+      if (issue.jsonCache) {
+        sendBuffer(store, res, 200, issue.jsonCache, { etag });
         return true;
       }
       sendJson(store, res, 200, store.issueJson(repo, issue));

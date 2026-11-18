@@ -39,20 +39,37 @@ function pathOf(req: IncomingMessage): string {
 export function createApp(): Server {
   const store = new Store();
   const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        // Git smart HTTP (/{owner}/{repo}.git/...). Returns true when handled.
-        if (await handleGit(store, token, req, res)) return;
-
-        // REST v3 (/api/v3/...). Returns true when handled.
-        if (await handleRest(store, token, req, res)) return;
-
-        // GraphQL v4 (/api/graphql). Returns true when handled.
-        if (await handleGraphql(store, token, req, res)) return;
-
-        // MCP (/mcp). Returns true when handled.
-        if (await handleMcp(store, token, req, res)) return;
+        const raw = req.url ?? '/';
+        // Route on the raw path prefix so a REST request never pays for the
+        // git handler's URL parse (and vice versa). Handlers still validate
+        // with their own parse, so a path the prefix check misroutes is
+        // answered 404 by the handler it lands in, exactly as before.
+        // Paths no prefix matches (healthz, unknown routes, odd encodings)
+        // fall through to every handler in the original order.
+        let handled = false;
+        if (raw.startsWith('/api/v3/') || raw === '/api/v3') {
+          handled = await handleRest(store, token, req, res);
+        }
+        if (!handled && raw.includes('.git/')) {
+          handled = await handleGit(store, token, req, res);
+        }
+        if (!handled && raw.startsWith('/api/graphql')) {
+          handled = await handleGraphql(store, token, req, res);
+        }
+        if (!handled && (raw === '/mcp' || raw.startsWith('/mcp/') || raw.startsWith('/mcp?'))) {
+          handled = await handleMcp(store, token, req, res);
+        }
+        if (!handled) {
+          handled =
+            (await handleGit(store, token, req, res)) ||
+            (await handleRest(store, token, req, res)) ||
+            (await handleGraphql(store, token, req, res)) ||
+            (await handleMcp(store, token, req, res));
+        }
+        if (handled) return;
 
         const path = pathOf(req);
         const method = req.method ?? 'GET';
@@ -82,4 +99,10 @@ export function createApp(): Server {
       }
     })();
   });
+  // Small sequential request/response pairs (the benchmarks) must not wait on
+  // Nagle: disable it on every accepted socket.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
 }

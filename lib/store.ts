@@ -7,7 +7,7 @@
 // Viewer identity is computed from the kit's fixed scenario seed
 // (SCENARIO_SEED 0x6a09e667f3bcc909n via wire.ts buildScenario()):
 // viewer adaiversen (id 1000), teammate quinnkeller, stranger olgabauer.
-import { createHash } from 'node:crypto';
+import { hash as sha1Hash } from 'node:crypto';
 import {
   makeBlob,
   makeCommit,
@@ -31,6 +31,8 @@ export const DEFAULT_BRANCH = 'main';
 export const ZERO_OID = '0000000000000000000000000000000000000000';
 /** Fixed epoch the suite itself uses for fixtures (2025-01-01). */
 export const EPOCH_SEC = 1735689600;
+/** The epoch as an ISO string, computed once: issueJson builds it per call otherwise. */
+const EPOCH_ISO = new Date(EPOCH_SEC * 1000).toISOString();
 
 /** Opaque, stable, reversible global ids: base64("<Type>:<...>"). */
 export function encodeGlobalId(...parts: (string | number)[]): string {
@@ -106,7 +108,7 @@ export interface Repo {
   labels: Map<string, Label>;
   createdSeq: number;
   /** Precomputed depth-1 pack for the clone benchmark (invalidated on ref change). */
-  clonePackCache: { tip: string; pack: Buffer } | null;
+  clonePackCache: { tip: string; pack: Buffer; shallow: string[] } | null;
 }
 
 export interface PullFile {
@@ -611,8 +613,8 @@ export class Store {
       state: issue.state,
       labels: issue.labels.map((name) => ({ name })),
       user: { login: repo.owner, id: VIEWER.id },
-      created_at: new Date(EPOCH_SEC * 1000).toISOString(),
-      updated_at: new Date(EPOCH_SEC * 1000).toISOString(),
+      created_at: EPOCH_ISO,
+      updated_at: EPOCH_ISO,
       html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
     };
   }
@@ -620,11 +622,26 @@ export class Store {
   private refreshIssueCache(_repo: Repo, issue: Issue): void {
     const text = JSON.stringify(this.issueJson(_repo, issue));
     issue.jsonCache = Buffer.from(text, 'utf8');
-    issue.etag = `"${this.sha1hex(issue.jsonCache)}"`;
+    // The ETag is NOT computed here: a SHA-1 per create is pure cost for the
+    // write benchmark, which never reads it. It is computed once, lazily, on
+    // the first single-issue GET (issueEtag) and cached per issue version.
+    issue.etag = null;
+  }
+
+  /**
+   * ETag of an issue's current representation, computed once per version.
+   * The only reader is the single-issue GET (If-None-Match + response header).
+   */
+  issueEtag(repo: Repo, issue: Issue): string {
+    if (issue.etag === null) {
+      if (issue.jsonCache === null) this.refreshIssueCache(repo, issue);
+      issue.etag = `"${this.sha1hex(issue.jsonCache!)}"`;
+    }
+    return issue.etag;
   }
 
   private sha1hex(buf: Buffer): string {
-    return createHash('sha1').update(buf).digest('hex');
+    return sha1Hash('sha1', buf, 'hex');
   }
 
   // -------------------------------------------------------------------------

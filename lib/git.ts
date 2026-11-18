@@ -145,14 +145,17 @@ function formatRefLine(line: RefLine): string {
 // ---------------------------------------------------------------------------
 // Advertisements
 // ---------------------------------------------------------------------------
+/** The v2 capability advertisement never changes: build it once, not per info/refs. */
+const UPLOAD_PACK_AD_V2 = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  pktFlush(),
+]);
+
 function uploadPackAdvertiseV2(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow\n'),
-    pktLine('object-format=sha1\n'),
-    pktFlush(),
-  ]);
+  return UPLOAD_PACK_AD_V2;
 }
 
 function uploadPackAdvertiseV0(store: Store, repo: Repo): Buffer {
@@ -329,17 +332,17 @@ function handleFetchV2(store: Store, repo: Repo, plan: FetchPlan, res: ServerRes
     const cached = repo.clonePackCache;
     if (cached && cached.tip === want) {
       pack = cached.pack;
-      const wantObj = store.getObject(want);
-      if (wantObj?.type === 'commit' && parseCommit(wantObj.data).parents.length > 0) {
-        shallow = [want];
-      }
+      shallow = cached.shallow;
     } else {
       const result = planFetch(store, plan);
       pack = result.pack;
       shallow = result.shallow;
       unshallow = result.unshallow;
       acked = result.acked;
-      repo.clonePackCache = { tip: want, pack };
+      // Cache the shallow list itself (the want commit has a parent iff it
+      // is listed there; a tag want lists its target instead): the hit path
+      // then skips the parseCommit that used to recompute it per clone.
+      repo.clonePackCache = { tip: want, pack, shallow: result.shallow };
     }
   } else {
     const result = planFetch(store, plan);
