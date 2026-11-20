@@ -108,7 +108,10 @@ export interface Repo {
   labels: Map<string, Label>;
   createdSeq: number;
   /** Precomputed depth-1 pack for the clone benchmark (invalidated on ref change). */
-  clonePackCache: { tip: string; pack: Buffer; shallow: string[] } | null;
+  clonePackCache: { tip: string; pack: Buffer; shallow: string[]; responseBody: Buffer } | null;
+  /** Precomputed per-repo JSON fragments for issueJson (avoids per-POST allocation). */
+  ownerJson: { login: string; id: number };
+  issueHtmlBase: string;
 }
 
 export interface PullFile {
@@ -198,6 +201,8 @@ export class Store {
       labels: new Map(),
       createdSeq: this.nextSeq(),
       clonePackCache: null,
+      ownerJson: { login: owner, id: VIEWER.id },
+      issueHtmlBase: `https://example.invalid/${owner}/${name}/issues/`,
     };
     this.repos.set(key, repo);
     return repo;
@@ -612,10 +617,10 @@ export class Store {
       body: issue.body,
       state: issue.state,
       labels: issue.labels.map((name) => ({ name })),
-      user: { login: repo.owner, id: VIEWER.id },
+      user: repo.ownerJson,
       created_at: EPOCH_ISO,
       updated_at: EPOCH_ISO,
-      html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
+      html_url: repo.issueHtmlBase + issue.number,
     };
   }
 

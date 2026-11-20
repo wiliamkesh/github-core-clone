@@ -25,11 +25,28 @@ const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const OID_RE = /^[0-9a-f]{40}$/;
 
+/** Shared empty body (avoids allocating a Buffer for body-less requests). */
+const EMPTY = Buffer.alloc(0);
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Single-chunk fast path: most payloads (push/clone/fetch) arrive in one
+    // TCP chunk. Keep the first chunk directly; only allocate the array +
+    // Buffer.concat when a second chunk arrives.
+    let first: Buffer | null = null;
+    let rest: Buffer[] | null = null;
+    req.on('data', (c: Buffer) => {
+      if (first === null) {
+        first = c;
+      } else {
+        if (rest === null) rest = [first];
+        rest.push(c);
+      }
+    });
+    req.on('end', () => {
+      if (rest !== null) resolve(Buffer.concat(rest));
+      else resolve(first ?? EMPTY);
+    });
     req.on('error', reject);
   });
 }
@@ -320,37 +337,45 @@ function handleLsRefs(store: Store, repo: Repo, args: Map<string, string[]>, res
   send(res, store, 200, UPLOAD_RESULT, Buffer.concat(parts));
 }
 
+/**
+ * Frame a depth-1 (no-haves) fetch response: shallow-info + packfile +
+ * sideband. Byte-identical to what the shared builder below produces for
+ * this path (no acknowledgments section: no haves were sent).
+ */
+function framePackResponse(shallow: string[], unshallow: string[], pack: Buffer): Buffer {
+  const parts: Buffer[] = [];
+  if (shallow.length > 0 || unshallow.length > 0) {
+    parts.push(pktLine('shallow-info\n'));
+    for (const s of shallow) parts.push(pktLine(`shallow ${s}\n`));
+    for (const s of unshallow) parts.push(pktLine(`unshallow ${s}\n`));
+    parts.push(pktFlush());
+  }
+  parts.push(pktLine('packfile\n'), sideband(pack));
+  return Buffer.concat(parts);
+}
+
 function handleFetchV2(store: Store, repo: Repo, plan: FetchPlan, res: ServerResponse): void {
   const hasHaves = plan.haves.length > 0;
-  let pack: Buffer;
-  let shallow: string[] = [];
-  let unshallow: string[] = [];
-  let acked: string[] = [];
-  // Depth-1 single-want fast path (clone benchmark): memoized pack per tip.
+  // Depth-1 single-want fast path (clone benchmark): memoized full response
+  // per tip. The hit path sends the cached buffer with zero framing work.
   if (plan.wants.length === 1 && plan.deepen === 1 && plan.haves.length === 0) {
     const want = plan.wants[0].toLowerCase();
     const cached = repo.clonePackCache;
     if (cached && cached.tip === want) {
-      pack = cached.pack;
-      shallow = cached.shallow;
-    } else {
-      const result = planFetch(store, plan);
-      pack = result.pack;
-      shallow = result.shallow;
-      unshallow = result.unshallow;
-      acked = result.acked;
-      // Cache the shallow list itself (the want commit has a parent iff it
-      // is listed there; a tag want lists its target instead): the hit path
-      // then skips the parseCommit that used to recompute it per clone.
-      repo.clonePackCache = { tip: want, pack, shallow: result.shallow };
+      send(res, store, 200, UPLOAD_RESULT, cached.responseBody);
+      return;
     }
-  } else {
     const result = planFetch(store, plan);
-    pack = result.pack;
-    shallow = result.shallow;
-    unshallow = result.unshallow;
-    acked = result.acked;
+    const responseBody = framePackResponse(result.shallow, result.unshallow, result.pack);
+    repo.clonePackCache = { tip: want, pack: result.pack, shallow: result.shallow, responseBody };
+    send(res, store, 200, UPLOAD_RESULT, responseBody);
+    return;
   }
+  const result = planFetch(store, plan);
+  const pack = result.pack;
+  const shallow = result.shallow;
+  const unshallow = result.unshallow;
+  const acked = result.acked;
   const parts: Buffer[] = [];
   // Acknowledgments ONLY when the client sent haves (negotiation round).
   // Real git (fetch-pack.c) goes straight to FETCH_GET_PACK when no haves

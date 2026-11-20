@@ -14,11 +14,31 @@ const JSON_TYPE = 'application/json; charset=utf-8';
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 const OID_RE = /^[0-9a-f]{40}$/i;
 
+/** Shared empty body (avoids allocating a Buffer for body-less requests). */
+const EMPTY = Buffer.alloc(0);
+
+/** Shared empty query params (used when the URL has no '?' at all). */
+const NO_PARAMS = new URLSearchParams();
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on('data', (c: Buffer) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    // Single-chunk fast path: most payloads (POST /issues) arrive in one TCP
+    // chunk. Keep the first chunk directly; only allocate the array +
+    // Buffer.concat when a second chunk arrives.
+    let first: Buffer | null = null;
+    let rest: Buffer[] | null = null;
+    req.on('data', (c: Buffer) => {
+      if (first === null) {
+        first = c;
+      } else {
+        if (rest === null) rest = [first];
+        rest.push(c);
+      }
+    });
+    req.on('end', () => {
+      if (rest !== null) resolve(Buffer.concat(rest));
+      else resolve(first ?? EMPTY);
+    });
     req.on('error', reject);
   });
 }
@@ -88,16 +108,17 @@ function str(v: unknown): string | null {
 }
 
 function getRepoOr404(store: Store, res: ServerResponse, owner: string, name: string): Repo | null {
+  // Look the repo up first: an existing repo skips the name-format regex
+  // entirely (the hot path). The regex only runs on a miss, where both
+  // failure modes answer the same 404.
+  const repo = store.getRepo(owner, name);
+  if (repo) return repo;
   if (!NAME_RE.test(owner) || !NAME_RE.test(name)) {
     notFound(store, res);
     return null;
   }
-  const repo = store.getRepo(owner, name);
-  if (!repo) {
-    notFound(store, res);
-    return null;
-  }
-  return repo;
+  notFound(store, res);
+  return null;
 }
 
 function baseUrl(req: IncomingMessage): string {
@@ -105,18 +126,72 @@ function baseUrl(req: IncomingMessage): string {
   return `http://${host}`;
 }
 
+/** Parse /api/v3/repos/{owner}/{repo}[/*] — exact equivalent of the old repoMatch regex. */
+function parseRepoPath(path: string): { owner: string; repoName: string; rest: string } | null {
+  const PREFIX = '/api/v3/repos/';
+  if (!path.startsWith(PREFIX)) return null;
+  const tail = path.slice(PREFIX.length);
+  const i1 = tail.indexOf('/');
+  if (i1 <= 0) return null;
+  const owner = tail.slice(0, i1);
+  const tail2 = tail.slice(i1 + 1);
+  const i2 = tail2.indexOf('/');
+  if (i2 === -1) {
+    if (tail2 === '') return null;
+    return { owner, repoName: tail2, rest: '' };
+  }
+  if (i2 === 0) return null;
+  return { owner, repoName: tail2.slice(0, i2), rest: tail2.slice(i2) };
+}
+
+/** True when s is one or more ASCII digits. */
+function isAllDigits(s: string): boolean {
+  if (s.length === 0) return false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 48 || c > 57) return false;
+  }
+  return true;
+}
+
+/** Parse /issues/{digits}[/comments] — exact equivalent of the old issueMatch regex. */
+function parseIssuePath(rest: string): { number: number; isComments: boolean } | null {
+  if (!rest.startsWith('/issues/')) return null;
+  const tail = rest.slice('/issues/'.length);
+  const slash = tail.indexOf('/');
+  if (slash === -1) {
+    if (!isAllDigits(tail)) return null;
+    return { number: parseInt(tail, 10), isComments: false };
+  }
+  const numPart = tail.slice(0, slash);
+  if (tail.slice(slash) !== '/comments') return null;
+  if (!isAllDigits(numPart)) return null;
+  return { number: parseInt(numPart, 10), isComments: true };
+}
+
 /**
  * Handle a REST v3 request. Returns true when the path is a REST route
  * (handled, whatever the outcome), false when it is not a REST path at all.
  */
 export async function handleRest(store: Store, token: string, req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    return false;
+  // Skip new URL() when the request-target has no query string and no
+  // percent-encoding: the pathname is then exactly the raw URL. `sp` is the
+  // query params (empty when there is no '?' at all, so .get() still
+  // returns null exactly like an empty URLSearchParams).
+  const rawUrl = req.url ?? '/';
+  let url: URL | null = null;
+  let path: string;
+  if (rawUrl.includes('?') || rawUrl.includes('%')) {
+    try {
+      url = new URL(rawUrl, 'http://entry');
+    } catch {
+      return false;
+    }
+    path = url.pathname;
+  } else {
+    path = rawUrl;
   }
-  const path = url.pathname;
+  const sp = url ? url.searchParams : NO_PARAMS;
   const method = req.method ?? 'GET';
   if (!path.startsWith('/api/v3/') && path !== '/api/v3') return false;
 
@@ -166,8 +241,8 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
       return true;
     }
     if (method === 'GET') {
-      const perPage = Math.min(100, Math.max(1, parseInt(url.searchParams.get('per_page') ?? '30', 10) || 30));
-      const page = Math.max(1, parseInt(url.searchParams.get('page') ?? '1', 10) || 1);
+      const perPage = Math.min(100, Math.max(1, parseInt(sp.get('per_page') ?? '30', 10) || 30));
+      const page = Math.max(1, parseInt(sp.get('page') ?? '1', 10) || 1);
       const all = store.listReposByOwner(VIEWER.login);
       const totalPages = Math.max(1, Math.ceil(all.length / perPage));
       const slice = all.slice((page - 1) * perPage, page * perPage);
@@ -186,13 +261,13 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
   }
 
   // -- /api/v3/repos/{owner}/{repo}[/*] --------------------------------------
-  const repoMatch = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)(\/.*)?$/.exec(path);
-  if (!repoMatch) {
+  const parsed = parseRepoPath(path);
+  if (!parsed) {
     // Unknown /api/v3 route: JSON 404 (protocol check).
     notFound(store, res);
     return true;
   }
-  const [, owner, repoName, rest = ''] = repoMatch;
+  const { owner, repoName, rest } = parsed;
 
   // POST /repos/{o}/{r}/git/refs
   if (rest === '/git/refs' && method === 'POST') {
@@ -235,7 +310,7 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
   if (rest === '/commits' && method === 'GET') {
     const repo = getRepoOr404(store, res, owner, repoName);
     if (!repo) return true;
-    const shaParam = url.searchParams.get('sha');
+    const shaParam = sp.get('sha');
     const ref = shaParam ? `refs/heads/${shaParam}` : repo.defaultBranch ? `refs/heads/${repo.defaultBranch}` : '';
     if (!repo.refs.has(ref)) {
       notFound(store, res);
@@ -284,7 +359,7 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
     if (method === 'GET') {
       const repo = getRepoOr404(store, res, owner, repoName);
       if (!repo) return true;
-      const refParam = url.searchParams.get('ref');
+      const refParam = sp.get('ref');
       const ref = refParam ? `refs/heads/${refParam}` : `refs/heads/${repo.defaultBranch}`;
       const found = store.readPath(repo, ref, filePath);
       if (!found) {
@@ -384,11 +459,11 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
     }
     if (method === 'GET') {
       const list = store.listIssues(repo, {
-        state: url.searchParams.get('state') ?? undefined,
-        sort: url.searchParams.get('sort') ?? undefined,
-        direction: url.searchParams.get('direction') ?? undefined,
+        state: sp.get('state') ?? undefined,
+        sort: sp.get('sort') ?? undefined,
+        direction: sp.get('direction') ?? undefined,
       });
-      const perPage = Math.min(100, Math.max(1, parseInt(url.searchParams.get('per_page') ?? '100', 10) || 100));
+      const perPage = Math.min(100, Math.max(1, parseInt(sp.get('per_page') ?? '100', 10) || 100));
       sendJson(store, res, 200, list.slice(0, perPage).map((i) => store.issueJson(repo, i)));
       return true;
     }
@@ -397,10 +472,10 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
   }
 
   // GET / PATCH /repos/{o}/{r}/issues/{n} ; POST / GET .../issues/{n}/comments
-  const issueMatch = /^\/issues\/(\d+)(\/comments)?$/.exec(rest);
-  if (issueMatch) {
-    const number = parseInt(issueMatch[1], 10);
-    const isComments = issueMatch[2] === '/comments';
+  const issueParsed = parseIssuePath(rest);
+  if (issueParsed) {
+    const number = issueParsed.number;
+    const isComments = issueParsed.isComments;
     const repo = getRepoOr404(store, res, owner, repoName);
     if (!repo) return true;
     const issue = store.getIssue(repo, number);
@@ -487,8 +562,8 @@ export async function handleRest(store: Store, token: string, req: IncomingMessa
       return true;
     }
     if (method === 'GET') {
-      const state = url.searchParams.get('state') ?? undefined;
-      const perPage = Math.min(100, Math.max(1, parseInt(url.searchParams.get('per_page') ?? '100', 10) || 100));
+      const state = sp.get('state') ?? undefined;
+      const perPage = Math.min(100, Math.max(1, parseInt(sp.get('per_page') ?? '100', 10) || 100));
       sendJson(store, res, 200, store.listPulls(repo, state).slice(0, perPage).map((p) => store.pullJson(repo, p)));
       return true;
     }
